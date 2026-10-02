@@ -664,10 +664,18 @@ class ReActAgent:
     def _dispatch(self, name: str, args: dict) -> ToolResult:
         """The innermost tool call — what `wrap_tool_call` wraps."""
         args = args if isinstance(args, dict) else {}
+        # `ARENA_SYSTEM_PROMPT` shows the tool name lowercase
+        # (`{"tool": "<search|fetch_doc|calc>", ...}`); a real model that
+        # paraphrases instead of copying can still drift to `"Search"` or
+        # pad it with whitespace. Normalising HERE (not where `parsed.tool`
+        # is first read) only changes which branch below fires — layers
+        # still see the model's own, unmodified `name` in `wrap_tool_call`.
+        if isinstance(name, str):
+            name = name.strip().lower()
         if name == "search":
             return self.tools.search(_as_text(args.get("query")), k=_as_k(args.get("k")))
         if name == "fetch_doc":
-            return self.tools.fetch_doc(_as_text(args.get("doc_id")))
+            return self.tools.fetch_doc(_normalise_doc_id(_as_text(args.get("doc_id"))))
         if name == "calc":
             return self.tools.calc(_as_text(args.get("expression")) or "0")
         return ToolResult(ok=False, content="", error=f"unknown tool: {name!r}")
@@ -683,6 +691,36 @@ def _as_k(value) -> int:
     except (TypeError, ValueError):
         return 5
     return max(1, min(MAX_SEARCH_K, k))
+
+
+#: A loose `doc_id`: `doc`, then an optional `-`/`_`/space, then 1-4
+#: digits — `doc-4`, `doc4`, `DOC_0004`, `doc 0004`. Case-insensitive.
+_LOOSE_DOC_ID_RE = re.compile(r"\A\s*doc[-_ ]?(\d{1,4})\s*\Z", re.IGNORECASE)
+
+
+def _normalise_doc_id(value: str) -> str:
+    """`doc-4` / `doc4` / `DOC-0004` -> the corpus's exact `doc-0004`.
+
+    `arena.corpus.Corpus.get` is a frozen exact-string dict lookup — it
+    does no normalisation of its own, and every id it holds is `doc-`
+    plus exactly four zero-padded digits. `REAL_MODEL_PROMPT_ADDENDUM`
+    §C warns a real model not to "rút gọn thành doc-4" precisely because
+    real endpoints do it anyway; when one does, the frozen lookup just
+    misses and the turn comes back `doc not found`, costing a tool call
+    for nothing `retry` can fix (the id, not the tool, was wrong).
+    `MockModel` always emits the exact four-digit form already, so this
+    is a no-op on every mock run — it only ever helps a real one.
+
+    Deliberately narrow: a string that is not THIS id in a slightly
+    different spelling (four digits can't round-trip through int() and
+    change value) is returned untouched, so a genuinely wrong id still
+    surfaces as `doc not found` instead of being redirected to some
+    other document.
+    """
+    match = _LOOSE_DOC_ID_RE.match(value)
+    if not match:
+        return value
+    return f"doc-{int(match.group(1)):04d}"
 
 
 __all__ = [

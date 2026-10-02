@@ -297,6 +297,11 @@ class MiddlewareStack:
     def before_model(self, ctx, messages: list[dict]) -> list[dict]:
         for layer in self.middleware:
             messages = layer.before_model(ctx, messages)
+            if not isinstance(messages, list):
+                raise TypeError(
+                    f"{layer.label}.before_model must return a list, got "
+                    f"{type(messages).__name__}"
+                )
         return messages
 
     def after_model(self, ctx, response):
