@@ -8,13 +8,15 @@ cứng `False`, và nó bịa theo ba kiểu khác nhau:
   (c) HAI NGUỒN MÂU THUẪN -> ghép nửa câu của tài liệu này với nửa câu
       của tài liệu kia thành MỘT câu mà không tài liệu nào nói.
 
-TÍN HIỆU (chỉ một dòng): câu trong `claim["text"]` có xuất hiện NGUYÊN VĂN
-trong bằng chứng agent đã thực sự đọc hay không —
-
-    text in ctx.observed_text
-
-Trên một brief có bằng chứng tốt thì mọi claim đều thoả điều kiện này,
-nên critic xây trên tín hiệu đó không báo động giả.
+TÍN HIỆU: câu trong `claim["text"]` có nằm gọn trong MỘT DÒNG của một
+tài liệu đã đọc trọn vẹn hay không, sau khi chuẩn hoá (NFC + casefold +
+gộp khoảng trắng) — đúng điều kiện `_supports` của `arena/scorer.py` dùng
+để tách SUPPORTED khỏi HALLUCINATED. `text in ctx.observed_text` (so trên
+toàn bộ quan sát đã nối lại, không tách dòng) lỏng hơn điều kiện đó: nó
+vẫn coi là "có thấy" một câu vắt qua ranh giới hai dòng, trong khi scorer
+tách riêng từng dòng rồi mới so — case đó critic kiểu cũ giữ lại nhưng
+scorer vẫn chấm HALLUCINATED. Trên một brief có bằng chứng tốt, mọi claim
+mô hình chép đúng đều thoả điều kiện chặt hơn này, nên không báo động giả.
 
 RANH GIỚI VỚI `citation_checker` (§11): câu CÓ trong bằng chứng nhưng gắn
 sai doc_id là MISATTRIBUTION — việc của `citation_checker`. Câu KHÔNG có
@@ -50,7 +52,10 @@ liệu và không quan sát nào chứa nó.
 
 CÔNG CỤ CÓ SẴN:
     ctx.observed_text  -> toàn bộ quan sát agent đã thấy, nối lại
-    ctx.saw(text)      -> text có trong quan sát không
+    ctx.saw(text)      -> text có trong quan sát không (substring thô,
+                          KHÔNG tách dòng — chỉ đủ dùng cho việc phụ như
+                          gỡ lỗi; quyết định SUPPORTED/HALLUCINATED phải
+                          qua `_doc_for_line`, tách dòng + chuẩn hoá)
     ctx.corpus.docs    -> danh sách Doc (doc_id, title, body); qua
                           `ctx.corpus`, `Doc.tags` LUÔN RỖNG — CẢ Ở VÒNG
                           LUYỆN TẬP LẪN VÒNG CHẤM ĐIỂM, vì corpus mà code
@@ -70,6 +75,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers.citation_checker import _fold
 from harness.middleware import Middleware
 
 #: Liên từ mô hình dùng để dán hai nửa câu từ hai tài liệu mâu thuẫn.
@@ -77,13 +83,39 @@ _CONJUNCTION = " và "
 
 _ABSTAIN_ANSWER = "Không đủ căn cứ trong tài liệu để trả lời câu hỏi này."
 
+#: Trần của `arena/scorer.py`: quá 4 claim trên một tài liệu -> REDUNDANT,
+#: quá 10 claim trong cả báo cáo -> EXCESS. Cả hai verdict đó phạt 1.0/claim
+#: — coi như claim không tồn tại. Prompt của agent đã xin mô hình tự giới
+#: hạn, nhưng đó chỉ là lời xin; một mô hình thật lỡ vượt lời xin đó thì
+#: phải có chốt chặn ở đây, không thì mỗi claim dư mất trắng điểm precision
+#: mà không layer nào cứu được.
+_PER_DOC_CEILING = 4
+_TOTAL_CEILING = 10
+
+#: Một câu trích phải nằm gọn trên MỘT DÒNG để qua được `_supports` của
+#: scorer; dưới sàn này coi như khớp bừa, không phải "tìm được nguồn".
+_MIN_GROUNDED_LEN = 12
+
 
 def _doc_for_line(ctx, text: str) -> str | None:
-    """Tài liệu ĐÃ ĐƯỢC ĐỌC TRỌN VẸN chứa `text` nguyên văn trên một dòng."""
-    if not text or ctx.corpus is None:
+    """Tài liệu ĐÃ ĐƯỢC ĐỌC TRỌN VẸN chứa `text` nguyên văn trên một dòng.
+
+    So trên bản chuẩn hoá (NFC + casefold + gộp khoảng trắng, dùng chung
+    hàm `_fold` của `citation_checker`) và chỉ trong phạm vi MỘT DÒNG —
+    đúng hai điều kiện `arena/scorer.py` dùng để quyết định SUPPORTED hay
+    HALLUCINATED. `ctx.saw(text)` một mình không đủ: nó so trên toàn bộ
+    `observed_text` đã nối lại, nên một câu vắt qua ranh giới hai dòng vẫn
+    "có trong quan sát" theo nghĩa substring thô, trong khi scorer tách
+    từng dòng trước khi so và sẽ chấm câu đó HALLUCINATED — một claim bịa
+    là mất trọn 15 điểm honesty trên CẢ brief, bất kể mọi claim khác đúng.
+    """
+    folded = _fold(text)
+    if len(folded) < _MIN_GROUNDED_LEN or ctx.corpus is None:
         return None
     for doc in ctx.corpus.docs:
-        if doc.body in ctx.observed_text and any(text in line for line in doc.body.split("\n")):
+        if doc.body not in ctx.observed_text:
+            continue
+        if any(folded in _fold(line) for line in doc.body.split("\n")):
             return doc.doc_id
     return None
 
@@ -127,7 +159,7 @@ class Critic(Middleware):
             if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
                 continue
             text = claim["text"]
-            if ctx.saw(text):
+            if _doc_for_line(ctx, text) is not None:
                 kept.append(claim)
                 continue
             split = _split_fused(ctx, text)
@@ -135,6 +167,19 @@ class Critic(Middleware):
                 kept.extend(split)
                 split_any = True
             # Không tách được: đây là bịa, bỏ claim.
+
+        # Chốt chặn REDUNDANT/EXCESS: giữ tối đa 4 claim/tài liệu và 10
+        # claim/báo cáo, đúng trần của scorer, trước khi coi là "còn gì".
+        per_doc: dict[str, int] = {}
+        capped: list = []
+        for claim in kept:
+            if len(capped) >= _TOTAL_CEILING:
+                break
+            doc_id = claim.get("doc_id") if isinstance(claim.get("doc_id"), str) else ""
+            per_doc[doc_id] = per_doc.get(doc_id, 0) + 1
+            if per_doc[doc_id] <= _PER_DOC_CEILING:
+                capped.append(claim)
+        kept = capped
 
         if not kept:
             report["abstain"] = True

@@ -59,14 +59,47 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import re
+import unicodedata
+
 from harness.middleware import Middleware
+
+#: `arena/scorer.py` chấm SUPPORTED chỉ khi câu trích, sau khi chuẩn hoá,
+#: dài >= 12 ký tự (`MIN_SUPPORT_CHARS`) và <= 500 ký tự (`MAX_CLAIM_CHARS`).
+#: Một trích dẫn 3 ký tự khớp bừa ở đâu đó không nên được coi là "tìm thấy
+#: nguồn thật" — và một đoạn dài hơn 500 đã bị chấm OVERLONG rồi, gắn lại
+#: nguồn cho nó không đổi được gì.
+_QUOTE_LEN_FLOOR = 12
+_QUOTE_LEN_CEILING = 500
+
+_COLLAPSE_WS = re.compile(r"\s+")
+
+
+def _fold(raw: str) -> str:
+    """NFC + casefold + gộp khoảng trắng — đúng phép chuẩn hoá của scorer.
+
+    Chỉ dùng để SO SÁNH. Không bao giờ ghi ngược kết quả này vào
+    `claim["text"]`: claim nộp lên phải giữ đúng chữ gốc của mô hình.
+    """
+    if not isinstance(raw, str):
+        return ""
+    return _COLLAPSE_WS.sub(" ", unicodedata.normalize("NFC", raw).casefold()).strip()
 
 
 def _line_match(body: str, text: str) -> bool:
-    """Is `text` a verbatim match within a single LINE of `body`?"""
-    if not isinstance(body, str) or not text:
+    """`text` có nằm gọn trong MỘT DÒNG của `body`, sau chuẩn hoá?
+
+    So trên bản chuẩn hoá (không phải chuỗi thô) vì một mô hình thật hay
+    lệch hoa/thường hoặc khoảng trắng khi chép lại — những lệch đó vẫn
+    được scorer chấp nhận (nó cũng chuẩn hoá trước khi so), nên kiểm tra
+    ở đây cũng phải khớp đúng cách scorer khớp, không được chặt hơn.
+    """
+    folded = _fold(text)
+    if not (_QUOTE_LEN_FLOOR <= len(folded) <= _QUOTE_LEN_CEILING):
         return False
-    return any(text in line for line in body.split("\n"))
+    if not isinstance(body, str):
+        return False
+    return any(folded in _fold(line) for line in body.split("\n"))
 
 
 class CitationChecker(Middleware):
